@@ -48,6 +48,27 @@ class RestoreUseDefaultValueCommand extends Command
             ->addOption('dry-run')
             ->addOption('force')
             ->addOption(
+                'include-different-values',
+                null,
+                null,
+                'If supplied all values will be set back to default level even if they differ',
+                null
+            )
+            ->addOption(
+                'store-id',
+                null,
+                InputOption::VALUE_OPTIONAL,
+                'Store to run on',
+                null
+            )
+            ->addOption(
+                'attribute-id',
+                null,
+                InputOption::VALUE_OPTIONAL,
+                'Attribute ID to clean up',
+                null
+            )
+            ->addOption(
                 'entity',
                 null,
                 InputOption::VALUE_OPTIONAL,
@@ -60,6 +81,9 @@ class RestoreUseDefaultValueCommand extends Command
     {
         $isDryRun = $input->getOption('dry-run');
         $isForce  = $input->getOption('force');
+        $includeDifferentValues   = $input->getOption('include-different-values');
+        $storeId   = $input->getOption('store-id');
+        $attributeId   = $input->getOption('attribute-id');
         $entity   = $input->getOption('entity');
 
         if (!in_array($entity, ['product', 'category'])) {
@@ -83,6 +107,11 @@ class RestoreUseDefaultValueCommand extends Command
             }
         }
 
+        if($storeId === 0 || $storeId === '0') {
+            $output->writeln('Cannot run on default level!');
+            return 1;
+        }
+
         $dbRead = $this->resourceConnection->getConnection('core_read');
         $dbWrite = $this->resourceConnection->getConnection('core_write');
         $counts = [];
@@ -94,18 +123,36 @@ class RestoreUseDefaultValueCommand extends Command
             $fullTableName = $this->resourceConnection->getTableName('catalog_' . $entity . '_entity_' . $table);
 
             // NULL values are handled separately
-            $query = $dbRead->query("SELECT * FROM $fullTableName WHERE store_id != 0 AND value IS NOT NULL");
+
+            $sql = 'SELECT * FROM '.$fullTableName.' WHERE store_id != 0';
+            if($storeId) {
+                $sql .= ' AND store_id = '.$storeId;
+            }
+            if($attributeId) {
+                $sql .= ' AND attribute_id = '.$attributeId;
+            }
+            $sql .= ' AND value IS NOT NULL';
+
+            $query = $dbRead->query($sql);
 
             $iterator = $this->iteratorFactory->create();
-            $iterator->walk($query, [function (array $result) use ($column, &$counts, $dbRead, $dbWrite, $fullTableName, $isDryRun, $output): void {
+            $iterator->walk($query, [function (array $result) use ($column, &$counts, $dbRead, $dbWrite, $fullTableName, $isDryRun, $includeDifferentValues, $output): void {
                 $row = $result['row'];
 
                 // Select the global value if it's the same as the non-global value
-                $query = $dbRead->query(
-                    'SELECT * FROM ' . $fullTableName
-                    . ' WHERE attribute_id = ? AND store_id = ? AND ' . $column . ' = ? AND BINARY value = ?',
-                    [$row['attribute_id'], 0, $row[$column], $row['value']]
-                );
+                if($includeDifferentValues) {
+                    $query = $dbRead->query(
+                        'SELECT * FROM ' . $fullTableName
+                        . ' WHERE attribute_id = ? AND store_id = ? AND ' . $column . ' = ?',
+                        [$row['attribute_id'], 0, $row[$column]]
+                    );
+                } else {
+                    $query = $dbRead->query(
+                        'SELECT * FROM ' . $fullTableName
+                        . ' WHERE attribute_id = ? AND store_id = ? AND ' . $column . ' = ? AND BINARY value = ?',
+                        [$row['attribute_id'], 0, $row[$column], $row['value']]
+                    );
+                }
 
                 $iterator = $this->iteratorFactory->create();
                 $iterator->walk($query, [function (array $result) use (&$counts, $dbWrite, $fullTableName, $isDryRun, $output, $row): void {
@@ -120,7 +167,7 @@ class RestoreUseDefaultValueCommand extends Command
                     }
 
                     $output->writeln(
-                        'Deleting value ' . $row['value_id'] . ' "' . $row['value'] . '" in favor of '
+                        'Store: '.$row['store_id'].' - Deleting value ' . $row['value_id'] . ' "' . $row['value'] . '" in favor of '
                         . $result['value_id']
                         . ' for attribute ' . $row['attribute_id'] . ' in table ' . $fullTableName
                     );
@@ -133,16 +180,30 @@ class RestoreUseDefaultValueCommand extends Command
                 }]);
             }]);
 
-            $nullCount = (int) $dbRead->fetchOne(
-                'SELECT COUNT(*) FROM ' . $fullTableName . ' WHERE store_id != 0 AND value IS NULL'
-            );
+            // Null values
+            $sql = 'SELECT COUNT(*) FROM ' . $fullTableName . ' WHERE store_id != 0';
+            if($storeId) {
+                $sql .= ' AND store_id = '.$storeId;
+            }
+            if($attributeId) {
+                $sql .= ' AND attribute_id = '.$attributeId;
+            }
+            $sql .= ' AND value IS NULL';
+
+            $nullCount = (int) $dbRead->fetchOne($sql);
 
             if (!$isDryRun && $nullCount > 0) {
                 $output->writeln("Deleting $nullCount NULL value(s) from $fullTableName");
                 // Remove all non-global null values
-                $dbWrite->query(
-                    'DELETE FROM ' . $fullTableName . ' WHERE store_id != 0 AND value IS NULL'
-                );
+                $sql = 'DELETE FROM ' . $fullTableName . ' WHERE store_id != 0';
+                if($storeId) {
+                    $sql .= ' AND store_id = '.$storeId;
+                }
+                if($attributeId) {
+                    $sql .= ' AND attribute_id = '.$attributeId;
+                }
+                $sql .= ' AND value IS NULL';
+                $dbWrite->query($sql);
             }
 
             if (count($counts)) {
